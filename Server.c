@@ -13,6 +13,15 @@
 #include <dirent.h>     // scandir
 #include <stdlib.h>     // free
 #include <sys/time.h>   // gettimeofday
+#include <ctype.h>      // isxdigit
+#include <signal.h>
+#include <pthread.h>
+ 
+typedef struct FdInfo {
+    int fd;
+    int epfd;
+    pthread_t tid;
+}FdInfo;
 
 int initListenFd(unsigned short port) {
     // 1. 创建监听fd
@@ -70,29 +79,44 @@ int epollRun(int lfd) {
         int num = epoll_wait(epfd, evs, sizeof(evs)/sizeof(evs[0]), -1); // "events" parameter is a buffer that will contain triggered events.
         for (int i = 0; i < num; ++i) {
             int fd = evs[i].data.fd;
+            FdInfo* info = (FdInfo*)malloc(sizeof(FdInfo));
+            info->epfd = epfd;
+            info->fd = fd;
             if (fd == lfd) {
                 // 建立连接：此时不会阻塞哦(内核已经检查过了)
-                acceptClient(lfd, epfd); // 建立连接会将新fd加到epoll树上，下一轮epoll_wait就会检测了
+                // 监听操作和通信操作都交给子线程
+                // acceptClient(lfd, epfd); // 建立连接会将新fd加到epoll树上，下一轮epoll_wait就会检测了
+                pthread_create(&info->tid, NULL, acceptClient, info); // 传出一个tid到info中
             } else {
                 // 数据通信: 主要是接收http数据 (write buffer一般都是可用的)
-                recvHttpRequest(fd, epfd);
+                // recvHttpRequest(fd, epfd);
+                pthread_create(&info->tid, NULL, recvHttpRequest, info);
             }
         }
     }
     return 0;
 }
 
-int acceptClient(int lfd, int epfd) {
+// note 10: 修改为多线程版本够应该修改函数原型
+// void* acceptClient(void* arg) {
+//     FdInfo* info = (FdInfo*)arg;
+//     acceptClient(info->lfd, info->epfd);
+//     free(info);
+//     return NULL;
+// } // C可不支持函数重载
+
+// int acceptClient(int lfd, int epfd) {
+void* acceptClient(void* arg) {
+    FdInfo* info = (FdInfo*)arg;
     // 1. 建立连接
-    
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
-    int cfd = accept(lfd, (struct sockaddr*)&addr, &addrlen); // 如果无需客户端的信息 指定为NULL即可
+    int cfd = accept(info->fd, (struct sockaddr*)&addr, &addrlen); // 如果无需客户端的信息 指定为NULL即可
     // question1: 为什么一次browser连接会建立两次连接
     printf("browser Socket %d, Address: %s:%d\n", cfd, inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
     if (cfd == -1) {
         perror("accept");
-        return -1;
+        return NULL;
     }
     // 2. 设置非阻塞
     // note 1: epoll的ET非阻塞模式效率最高
@@ -103,21 +127,25 @@ int acceptClient(int lfd, int epfd) {
     struct epoll_event ev;
     ev.data.fd = cfd;
     ev.events = EPOLLIN | EPOLLET; // 设置ET模式
-    int ret = epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev);
+    int ret = epoll_ctl(info->epfd, EPOLL_CTL_ADD, cfd, &ev);
     if (ret == -1) {
         perror("epoll_ctl");
-        return -1;
+        return NULL;
     }
-    return 0;
+    printf("acceptClient threadID: %ld\n", info->tid);
+    free(info); // note 11: 传入参数是堆内存，当对应任务处理完成之后(双方建立连接之后)就可以释放内存了
+    return NULL;
 }
 
-int recvHttpRequest(int cfd, int epfd) {
+// int recvHttpRequest(int cfd, int epfd) {
+void* recvHttpRequest(void* arg) {
+    FdInfo* info = (FdInfo*)arg;
     // 1. 接收数据
     char buf[4096] = {0}; // 搞一块内存用于接受客户端传输来的get请求 (超过4096的不要了)
     char tmp[1024] = {0};
     int len = 0;
     int total = 0;
-    while ((len = recv(cfd, tmp, sizeof(buf), 0)) > 0) {
+    while ((len = recv(info->fd, tmp, sizeof(buf), 0)) > 0) {
         if (total + len < sizeof buf) {
             memcpy(buf + total, tmp, len);
         }
@@ -126,22 +154,24 @@ int recvHttpRequest(int cfd, int epfd) {
     // 2. 判断数据是否接收完毕
     // note2: 如果read buffer中没数据了，我们的recv是非阻塞的，依然会持续读数据，此时返回-1 && errno=EAGAIN
     if (len == -1 && errno == EAGAIN) {
-        printf("HTTP Request Message: \n%s\n", buf);
+        // printf("HTTP Request Message: \n%s\n", buf);
         // 3. 解析http请求行(GET version)
         char* pt = strstr(buf, "\r\n");
         // 根据请求行长度在尾部添加\0 将http请求报文的*请求行*截取下来
         int reqLen = pt - buf;
         buf[reqLen] = '\0';
-        parseRequestLine(buf, cfd); // 解析并发送http response
+        parseRequestLine(buf, info->fd); // 解析并发送http response
     } else if (len == 0) {
         // 4. 客户端断开连接
-        epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, NULL);
-        close(cfd);
+        epoll_ctl(info->epfd, EPOLL_CTL_DEL, info->fd, NULL);
+        close(info->fd);
     } else {
         perror("recv");
-        return -1;
+        return NULL;
     }
-    return 0;
+    printf("recv message threadID: %ld\n", info->tid);
+    free(info);
+    return NULL;
 }
 
 int parseRequestLine(const char* line, int cfd) {
@@ -154,6 +184,9 @@ int parseRequestLine(const char* line, int cfd) {
     if (strcasecmp(method, "get") != 0) { // ignoring the case of the characters
         return -1;
     }
+    decodeMsg(path, path);
+    // printf("method: %s, path_after_decode: %s\n", method, path);
+
     // 2. 处理客户端请求的静态资源(目录或文件)
     // 需要注意我们在main中已经将服务器路径切换到了资源路径(绝对路径), 后面我们就可以用相对路径操作了 (将http请求中的目录("/形式")切换为我们设置的相对目录)
     char* file = NULL;
@@ -241,16 +274,19 @@ int sendFile(const char* fileName, int cfd) {
     int size = lseek(fd, 0, SEEK_END); // 借助lseek获取文件大小; 注意：这里的fd同事会被移动到文件末尾
     lseek(fd, 0, SEEK_SET); // 将fd移动到文件头部
     // note8: sendfile的发送缓存容量是有限的，文件大小超过该限度是无法写入缓存的，即无法一次性发送到对端，也需要多次发送
+    signal(SIGPIPE, SIG_IGN); // 解决mp3无法播放问题
     while (offset < size) {
-        // printf("offset: %ld\n", offset);
         int ret = sendfile(cfd, fd, &offset, size); // sendfile很智能啊，会自动修改传入的offset的值，指示现在fd的位置
         // note9: sendfile出现-1是因为cfd被我们设置为非阻塞（正常）TODO 内部机制需要进一步研究；第三个参数也很有用
-        // printf("ret value: %d\n", ret);
         if (ret == -1) {
+            if (errno != EAGAIN)
+                break;
             // printf("没数据...\n"); // sendfile内部不一致大概是 此时数据还没来
             // pass
         }
     }
+    printf("here\n");
+
 
 #endif
     gettimeofday(&end, NULL);
@@ -364,4 +400,28 @@ const char* getFileType(const char* name) {
     if (strcmp(dot, ".mp3") == 0)
         return "audio/mpeg";
     return "text/plain; charset=utf-8";
+}
+
+// 将字符转换为整数
+int hexToDec(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10; // 'a' -> 10 (hex)
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return 0;
+}
+
+// 将http编码后的字符串转换为普通字符串
+void decodeMsg(char* to, char* from) {
+    for (; *from != '\0'; ++from, ++to) {
+        if (*from == '%' && isxdigit(from[1]) && isxdigit(from[2])) {
+            *to = hexToDec(from[1]) * 16 + hexToDec(from[2]);
+            from += 2;
+        } else {
+            *to = *from;
+        }
+    }
+    *to = '\0';
 }

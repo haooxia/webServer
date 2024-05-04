@@ -5,9 +5,11 @@ int initListenFd(unsigned short port);
 // 启动epoll
 int epollRun(int lfd);
 // 与客户端建立连接
-int acceptClient(int lfd, int epfd);
+// int acceptClient(int lfd, int epfd);
+void* acceptClient(void* arg);
 // 接收http请求
-int recvHttpRequest(int cfd, int epfd); // 可能会从epoll树删除节点
+// int recvHttpRequest(int cfd, int epfd); // 可能会从epoll树删除节点
+void* recvHttpRequest(void* arg); // 多线程版本
 // 解析请求行
 int parseRequestLine(const char* line, int cfd);
 // 发送文件
@@ -18,3 +20,6 @@ int sendDir(const char* dirName, int cfd);
 int sendHeadMsg(int cfd, int status, const char* descr, const char* type, int length);
 // 文件后缀->content-type
 const char* getFileType(const char* name);
+// 转义http
+int hexToDec(char c);
+void decodeMsg(char* to, char* from);
